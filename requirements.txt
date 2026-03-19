@@ -1,0 +1,5 @@
+anthropic
+python-dotenv
+httpx
+beautifulsoup4
+rich
