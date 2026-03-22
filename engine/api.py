@@ -1,37 +1,17 @@
 """
 Async Claude API wrapper for the RFA Engine.
-All calls go through call_claude(); streaming is used by default.
-Token usage is accumulated per-session for cost estimation.
+All calls go through call_claude(); uses the Claude CLI for auth.
+Token usage tracking is approximate (CLI does not expose token counts).
 """
 
 import asyncio
-import os
-import anthropic
-from dotenv import load_dotenv
-
-load_dotenv()
+import shutil
 
 MODEL = "claude-opus-4-6"
 
-# Pricing per million tokens (claude-opus-4-6)
-_INPUT_COST_PER_MTOK  = 15.00
-_OUTPUT_COST_PER_MTOK = 75.00
-
-_client: anthropic.AsyncAnthropic | None = None
-
-# Session-level token accumulator
+# Session-level token accumulator (approximate — CLI does not expose counts)
 _total_input_tokens  = 0
 _total_output_tokens = 0
-
-
-def get_client() -> anthropic.AsyncAnthropic:
-    global _client
-    if _client is None:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY not set in environment or .env file")
-        _client = anthropic.AsyncAnthropic(api_key=api_key)
-    return _client
 
 
 def reset_token_counter() -> None:
@@ -42,13 +22,11 @@ def reset_token_counter() -> None:
 
 def get_token_usage() -> dict:
     """Return token counts and estimated cost for the current session."""
-    input_cost  = (_total_input_tokens  / 1_000_000) * _INPUT_COST_PER_MTOK
-    output_cost = (_total_output_tokens / 1_000_000) * _OUTPUT_COST_PER_MTOK
     return {
         "input_tokens":  _total_input_tokens,
         "output_tokens": _total_output_tokens,
         "total_tokens":  _total_input_tokens + _total_output_tokens,
-        "estimated_cost_usd": round(input_cost + output_cost, 4),
+        "estimated_cost_usd": 0.0,  # not available via CLI
     }
 
 
@@ -59,38 +37,41 @@ async def call_claude(
     _retries: int = 5,
 ) -> str:
     """
-    Make a single async Claude API call and return the response text.
-    Retries on overload/rate-limit errors with exponential backoff.
-    Accumulates token usage for cost estimation.
+    Make a single async Claude call via the Claude CLI and return the response text.
+    Retries on transient failures with exponential backoff.
     """
-    global _total_input_tokens, _total_output_tokens
-
-    client = get_client()
+    cli = shutil.which("claude") or "claude"
     delay = 8.0
 
     for attempt in range(_retries + 1):
         try:
-            response = await client.messages.create(
-                model=MODEL,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
+            proc = await asyncio.create_subprocess_exec(
+                cli,
+                "--model", MODEL,
+                "--system-prompt", system_prompt,
+                "-p", user_message,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
 
-            if response.usage:
-                _total_input_tokens  += response.usage.input_tokens
-                _total_output_tokens += response.usage.output_tokens
+            if proc.returncode != 0:
+                err = stderr.decode().strip()
+                if attempt < _retries:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 60.0)
+                    continue
+                raise RuntimeError(f"Claude CLI error (exit {proc.returncode}): {err}")
 
-            text_blocks = [b.text for b in response.content if b.type == "text"]
-            return "\n".join(text_blocks)
+            return stdout.decode().strip()
 
-        except anthropic.APIStatusError as e:
-            if e.status_code in (429, 500, 529) and attempt < _retries:
+        except asyncio.TimeoutError:
+            if attempt < _retries:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60.0)
                 continue
-            raise
-        except anthropic.APIConnectionError:
+            raise RuntimeError("Claude CLI call timed out")
+        except Exception:
             if attempt < _retries:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 60.0)
