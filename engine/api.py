@@ -53,7 +53,7 @@ async def call_claude(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
 
             if proc.returncode != 0:
                 err = stderr.decode().strip()
